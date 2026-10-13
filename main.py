@@ -10,6 +10,12 @@ KEY = os.getenv("ANTHROPIC_KEY")
 APP_PASSWORD = os.getenv("APP_PASSWORD")
 VAPID_EMAIL = os.getenv("VAPID_EMAIL", "learning-app@example.com")
 MODEL = os.getenv("MODEL", "claude-haiku-5-5")
+MODEL_CHOICES = [
+    ("", "Auto (study material uses the study model, everything else Haiku)"),
+    ("claude-haiku-5-5", "Haiku: fastest, cheapest"),
+    ("claude-sonnet-5-5", "Sonnet: stronger, several times the cost"),
+    ("claude-opus-5-5", "Opus: strongest, much higher cost"),
+]
 NZ = pytz.timezone("Pacific/Auckland")
 
 TOPICS = [
@@ -38,8 +44,8 @@ TOPICS = [
 ]
 MIN_MINUTES = float(os.getenv("MIN_MINUTES", 30))
 MAX_MINUTES = float(os.getenv("MAX_MINUTES", 90))
-QUIET_START = 22
-QUIET_END = 8
+QUIET_START = int(os.getenv("QUIET_START", 19))   # no notifications from 7pm NZ time...
+QUIET_END = int(os.getenv("QUIET_END", 9))        # ...until 9am
 REVIEW_CHANCE = 0.6
 REVIEW_BACKLOG_LIMIT = 5
 INTERVALS_DAYS = [1, 3, 7, 16, 35, 90, 180]
@@ -47,6 +53,14 @@ MAX_QUEUE = 3
 
 DATA_FILE = os.path.join(os.getenv("DATA_DIR", "."), "learning_data.json")
 lock = threading.Lock()
+
+GRAPH_SPEC = """MATH AND GRAPH FORMATTING:
+- Write all mathematics in LaTeX: inline as $...$ and display equations as $$...$$ on their own lines. Never write equations in plain text. Write money as USD 5 or NZD 5, never with a dollar sign.
+- To show a graph, include a fenced block exactly like this (valid JSON, at most 2 graphs per reply, only when a diagram genuinely helps):
+```graph
+{"title":"Supply and demand","xlabel":"Quantity","ylabel":"Price","xmin":0,"xmax":10,"ymin":0,"ymax":10,"curves":[{"label":"Demand","expr":"10 - x"},{"label":"Supply","expr":"2 + 0.5*x"}],"points":[{"label":"Equilibrium","x":5.33,"y":4.67}]}
+```
+- expr is a formula in x using math.js syntax: ^ for powers, exp(x), log(x), sqrt(x). For data instead of formulas use "series":[{"label":"...","data":[[x,y],[x,y]]}]. ymin and ymax are optional. Compute any marked points (such as intersections) exactly, and only plot things you can state correctly."""
 
 CARD_TOOL = {
     "name": "make_card",
@@ -56,7 +70,7 @@ CARD_TOOL = {
         "properties": {
             "kind": {"type": "string", "enum": ["quiz", "fact"]},
             "title": {"type": "string", "description": "Short title, max 8 words"},
-            "content": {"type": "string", "description": "For a fact: a 150-250 word mini-lesson that builds the idea step by step, with the reasoning and a worked example or key formula where relevant. For a quiz: a scenario-based question that tests understanding, not memory."},
+            "content": {"type": "string", "description": "For a fact: a 150-250 word mini-lesson that builds the idea step by step, with the reasoning and a worked example or key formula where relevant (maths in LaTeX). For a quiz: a scenario-based question that tests understanding, not memory."},
             "options": {"type": "array", "items": {"type": "string"}, "description": "Exactly 4 options for a quiz, empty for a fact"},
             "correct_index": {"type": "integer", "description": "0-3 for a quiz, -1 for a fact"},
             "explanation": {"type": "string", "description": "For a quiz: why the right answer is right and why each wrong option fails, 4-6 sentences. Empty for a fact."},
@@ -69,9 +83,11 @@ CARD_TOOL = {
 TUTOR_SYSTEM = ("You are a rigorous university tutor for a postgraduate studying economics and finance, who wants to understand "
                 "topics in real depth across many fields. Teach at university level: explain the mechanism or theory, give a worked "
                 "example, flag common misconceptions, and connect ideas to related concepts. Be precise, and say plainly if you are "
-                "unsure or if scholars disagree. After a substantial explanation, end with one question that checks whether the "
-                "learner really understood. If they answer, give honest feedback on what is right and what is missing. "
-                "Use plain text with no markdown formatting. Always finish your last sentence.")
+                "unsure or if scholars disagree. Keep each reply to roughly 350-550 words: for a big topic, teach one step at a time "
+                "and say what the next step would be instead of covering everything at once. Use short paragraphs, **bold** for key "
+                "terms, and simple '-' bullet lists when helpful, with no headings. After a substantial explanation, end with one "
+                "question that checks whether the learner really understood. If they answer, give honest feedback on what is right "
+                "and what is missing. Always finish your last sentence.\n\n" + GRAPH_SPEC)
 
 def now_nz():
     return datetime.datetime.now(NZ)
@@ -93,6 +109,7 @@ def load_data():
     d.setdefault("focus", None)
     d.setdefault("subs", [])
     d.setdefault("vapid_pem", None)
+    d.setdefault("model", None)
     return d
 
 def save_data():
@@ -139,8 +156,8 @@ def push_all(title, body):
             save_data()
     return sent
 
-def call_claude(messages, system=None, tools=None, tool_choice=None, max_tokens=2000):
-    body = {"model": MODEL, "max_tokens": max_tokens, "messages": messages}
+def call_claude(messages, system=None, tools=None, tool_choice=None, max_tokens=2000, model=None):
+    body = {"model": data.get("model") or model or MODEL, "max_tokens": max_tokens, "messages": messages}
     if system:
         body["system"] = system
     if tools:
@@ -148,7 +165,7 @@ def call_claude(messages, system=None, tools=None, tool_choice=None, max_tokens=
         body["tool_choice"] = tool_choice
     r = requests.post("https://api.anthropic.com/v1/messages",
                       headers={"x-api-key": KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                      json=body, timeout=90)
+                      json=body, timeout=120)
     if r.status_code != 200:
         raise RuntimeError(f"API error {r.status_code}: {r.text[:200]}")
     return r.json()
@@ -162,11 +179,13 @@ def generate_new_card():
 The learner is a university postgraduate in economics and finance who wants real, university-level understanding of a wide range of subjects, not trivia.
 Teach the underlying mechanism, theory or argument, not just a fact. Include the reasoning, and a worked example or key formula where it helps. Pick a specific, substantive idea within the topic.
 For a quiz, write a scenario or application question that needs reasoning to answer, with exactly 4 plausible options (the wrong ones should reflect common misconceptions) and the correct position at random.
-For a fact, also write recall_question: a question that makes the learner explain or apply the idea, without revealing the answer.
+For a fact, also write recall_question: a question that makes the learner explain or apply the idea, without revealing the answer. A fact lesson may include one graph block if a diagram genuinely helps.
 Accuracy matters most. Only include material you are confident is correct and well established.
-Do not repeat or closely overlap these recently shown cards: {recent}"""
+Do not repeat or closely overlap these recently shown cards: {recent}
+
+{GRAPH_SPEC}"""
     resp = call_claude([{"role": "user", "content": prompt}], tools=[CARD_TOOL],
-                       tool_choice={"type": "tool", "name": "make_card"}, max_tokens=2000)
+                       tool_choice={"type": "tool", "name": "make_card"}, max_tokens=2500)
     card = None
     for b in resp.get("content", []):
         if b.get("type") == "tool_use":
@@ -313,6 +332,8 @@ def build_state():
             "topics": TOPICS,
             "devices": len(data["subs"]),
             "queue": len(data["queue"]),
+            "model": data.get("model") or "",
+            "models": MODEL_CHOICES,
         }
 
 def scheduler():
@@ -352,7 +373,7 @@ def need_auth(f):
 
 @app.after_request
 def no_cache(resp):
-    if request.path.startswith("/api/"):
+    if request.path.startswith("/api/") or request.path.startswith("/study/api/"):
         resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -517,7 +538,7 @@ def api_chat():
     msgs = []
     for m in (b.get("messages") or [])[-14:]:
         if m.get("role") in ("user", "assistant") and m.get("content"):
-            msgs.append({"role": m["role"], "content": str(m["content"])[:6000]})
+            msgs.append({"role": m["role"], "content": str(m["content"])[:8000]})
     while msgs and msgs[0]["role"] != "user":
         msgs.pop(0)
     if not msgs:
@@ -530,13 +551,23 @@ def api_chat():
             system += (f"\nOptions: {inst['options']}\nCorrect answer: {inst['options'][inst['correct_index']]}"
                        f"\nExplanation: {inst.get('explanation', '')}"
                        "\nIf the learner has not answered the quiz yet, do not reveal the answer unless they ask.")
+    parts = []
+    cur = list(msgs)
     try:
-        resp = call_claude(msgs, system=system, max_tokens=1800)
-        reply = "".join(x.get("text", "") for x in resp.get("content", []) if x.get("type") == "text").strip()
+        for _ in range(4):
+            resp = call_claude(cur, system=system, max_tokens=2500)
+            txt = "".join(x.get("text", "") for x in resp.get("content", []) if x.get("type") == "text")
+            parts.append(txt)
+            if resp.get("stop_reason") != "max_tokens":
+                break
+            cur = cur + [{"role": "assistant", "content": txt},
+                         {"role": "user", "content": "Continue exactly where you left off. Do not repeat anything."}]
+        else:
+            parts.append("\n\n[Very long reply, stopped here. Ask me to carry on.]")
     except Exception as e:
-        return jsonify(error=f"Couldn't reach Claude: {e}"), 500
-    if resp.get("stop_reason") == "max_tokens":
-        reply += "\n\n[This reply hit the length limit. Type 'continue' to get the rest.]"
+        if not parts:
+            return jsonify(error=f"Couldn't reach Claude: {e}"), 500
+    reply = "".join(parts).strip()
     return jsonify(reply=reply or "I couldn't come up with an answer, try rephrasing.")
 
 @app.post("/api/settings")
@@ -555,6 +586,9 @@ def api_settings():
         elif a == "focus":
             v = str(b.get("value") or "").strip()[:80]
             data["focus"] = v or None
+        elif a == "model":
+            v = str(b.get("value") or "")
+            data["model"] = v if v in {k for k, _ in MODEL_CHOICES if k} else None
         save_data()
     return jsonify(build_state())
 
@@ -597,6 +631,10 @@ APP_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#14151b"><link rel="manifest" href="/manifest.json">
 <link rel="icon" href="/icon-192.png"><title>Learning</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mathjs@13.2.0/lib/browser/math.js"></script>
 <style>
 :root{--bg:#14151b;--card:#1e1f26;--card2:#2b2d38;--fg:#e8e8ee;--muted:#9aa0b4;--accent:#4f8cff;--good:#2e9e5b;--bad:#c0453f}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,sans-serif;padding-bottom:76px}
@@ -605,16 +643,19 @@ header{display:flex;justify-content:space-between;align-items:center;padding:14p
 main{max-width:680px;margin:0 auto;padding:0 14px}
 .panel{background:var(--card);border-radius:16px;padding:18px;margin-bottom:14px}
 .tag{color:var(--accent);font-size:12px;font-weight:700;letter-spacing:.04em}
-h2{margin:6px 0 10px;font-size:21px}.q{font-size:16px;line-height:1.6;margin:0 0 14px;white-space:pre-wrap}
+h2{margin:6px 0 10px;font-size:21px}.q{font-size:16px;line-height:1.6;margin:0 0 14px}
 .muted{color:var(--muted);font-size:14px;line-height:1.5}
 .opt,.btn{display:block;width:100%;text-align:left;border:0;border-radius:12px;padding:14px;margin-bottom:8px;font-size:15px;color:var(--fg);background:var(--card2);cursor:pointer;min-height:48px}
 .btn{text-align:center;font-weight:600}.primary{background:var(--accent);color:#fff}.ghost{background:transparent;border:1px solid #3a3d4d}
 .opt.good{background:var(--good);color:#fff}.opt.bad{background:var(--bad);color:#fff}.opt:disabled{opacity:1}
-.row{display:flex;gap:8px}.row .btn{margin-bottom:0}.fb{margin:6px 0 12px;line-height:1.6;white-space:pre-wrap}
+.row{display:flex;gap:8px}.row .btn{margin-bottom:0}.fb{margin:6px 0 12px;line-height:1.6}
 .goodtxt{color:#5fd493}.badtxt{color:#ee8a84}
-#log{max-height:55vh;overflow-y:auto;margin-bottom:10px}
-.msg{padding:10px 12px;border-radius:12px;margin-bottom:8px;white-space:pre-wrap;line-height:1.6;font-size:15px}
-.msg.user{background:var(--accent);margin-left:20%}.msg.bot{background:var(--card2);margin-right:4%}
+#log{max-height:60vh;overflow-y:auto;margin-bottom:10px}
+.msg{padding:10px 12px;border-radius:12px;margin-bottom:8px;line-height:1.6;font-size:15px}
+.msg.user{background:var(--accent);margin-left:20%;white-space:pre-wrap}.msg.bot{background:var(--card2);margin-right:4%}
+.rich p{margin:0 0 10px}.rich p:last-child{margin-bottom:0}.rich ul,.rich ol{margin:0 0 10px;padding-left:22px}.opt p{margin:0}
+.gr{height:300px;margin:12px 0;background:#181920;border-radius:10px;padding:8px}
+.katex-display{overflow-x:auto;overflow-y:hidden;padding:4px 0;margin:.6em 0}
 #chatrow{display:flex;gap:8px}#chatin{flex:1;background:var(--card2);color:var(--fg);border:0;border-radius:12px;padding:13px;font-size:16px}
 #chatsend{width:84px;margin:0}
 nav{position:fixed;bottom:0;left:0;right:0;background:var(--card);display:flex;border-top:1px solid #2b2d38}
@@ -626,8 +667,9 @@ nav button.on{color:var(--accent);font-weight:700}
 .l1{background:#2c4a80!important}.l2{background:#3b6bc4!important}.l3{background:#4f8cff!important}
 select{width:100%;background:var(--card2);color:var(--fg);border:0;border-radius:12px;padding:13px;font-size:15px;margin-bottom:8px}
 .trow{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid #2b2d38;font-size:14px;gap:10px}
+.sbtn{border:1px solid #3a3d4d;background:transparent;color:var(--muted);border-radius:999px;padding:6px 12px;font-size:13px;font-weight:600;cursor:pointer;margin-right:8px}.sbtn.on{background:var(--accent);border-color:var(--accent);color:#fff}
 </style></head><body>
-<header><span>📚 Learning</span><span id="streak"></span></header>
+<header><span>📚 Learning</span><span><button id="studybtn" class="sbtn" hidden></button> <span id="streak"></span></span></header>
 <main>
 <section id="v-study">
   <div class="panel" id="card"></div>
@@ -639,7 +681,7 @@ select{width:100%;background:var(--card2);color:var(--fg);border:0;border-radius
 <section id="v-stats" hidden></section>
 <section id="v-set" hidden></section>
 </main>
-<nav><button id="n-study" class="on">Study</button><button id="n-stats">Stats</button><button id="n-set">Settings</button></nav>
+<nav><button id="n-study" class="on">Study</button><button id="n-stats">Stats</button><button id="n-set">Settings</button><button onclick="location.href='/study'">Materials</button></nav>
 <script>
 const $=s=>document.querySelector(s);
 function el(t,c,x){const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e}
@@ -649,6 +691,56 @@ async function api(p,b){
   if(r.status===401){location.reload();return{}}
   let j={};try{j=await r.json()}catch(e){}
   if(!r.ok&&!j.error)j.error='Request failed ('+r.status+')';return j}
+
+/* ---------- rich text: maths (KaTeX), light markdown, graphs (Chart.js + math.js) ---------- */
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function md(s){
+  let h=esc(s).replace(/^#{1,4}\s+(.+)$/gm,'<strong>$1</strong>').replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>');
+  const li=/^\s*([-*•]|\d+[.)])\s+/;
+  return h.split(/\n{2,}/).map(b=>{
+    const lines=b.split('\n');
+    if(lines.length&&lines.every(l=>li.test(l))){
+      const ord=/^\s*\d/.test(lines[0]);
+      return (ord?'<ol>':'<ul>')+lines.map(l=>'<li>'+l.replace(li,'')+'</li>').join('')+(ord?'</ol>':'</ul>')}
+    return '<p>'+lines.join('<br>')+'</p>'}).join('')}
+const PAL=['#4f8cff','#f5a742','#5fd493','#ee6a84','#b48cff','#4fd1d9'];
+function drawGraph(node,src){
+  let g;try{g=JSON.parse(src)}catch(e){node.textContent='(graph could not be read)';return}
+  if(!window.Chart||!window.math){node.textContent='(graph libraries did not load)';return}
+  try{
+    const x0=Number(g.xmin??0),x1=Number(g.xmax??10),sets=[];let i=0;
+    for(const c of (g.curves||[])){
+      let f;try{f=math.compile(String(c.expr))}catch(e){continue}
+      const pts=[];
+      for(let k=0;k<=160;k++){const x=x0+(x1-x0)*k/160;let y;try{y=f.evaluate({x})}catch(e){continue}
+        if(typeof y==='number'&&isFinite(y))pts.push({x,y})}
+      sets.push({label:c.label||String(c.expr),data:pts,showLine:true,pointRadius:0,borderWidth:2.5,borderColor:PAL[i%6],backgroundColor:PAL[i%6]});i++}
+    for(const s of (g.series||[])){
+      sets.push({label:s.label||'',data:(s.data||[]).map(p=>({x:p[0],y:p[1]})),showLine:true,pointRadius:3,borderWidth:2,borderColor:PAL[i%6],backgroundColor:PAL[i%6]});i++}
+    for(const p of (g.points||[])){
+      sets.push({label:p.label||'',data:[{x:p.x,y:p.y}],showLine:false,pointRadius:6,borderColor:'#ffffff',backgroundColor:PAL[i%6]});i++}
+    const canvas=document.createElement('canvas');node.replaceChildren(canvas);
+    const ax=(t)=>({title:{display:!!t,text:t||'',color:'#9aa0b4'},grid:{color:'#2f3240'},ticks:{color:'#9aa0b4'}});
+    new Chart(canvas,{type:'scatter',data:{datasets:sets},options:{responsive:true,maintainAspectRatio:false,animation:false,
+      scales:{x:Object.assign({type:'linear',min:x0,max:x1},ax(g.xlabel)),y:Object.assign({type:'linear',min:g.ymin,max:g.ymax},ax(g.ylabel))},
+      plugins:{legend:{labels:{color:'#e8e8ee'}},title:{display:!!g.title,text:g.title||'',color:'#e8e8ee'}}}});
+  }catch(e){node.textContent='(graph could not be drawn)'}}
+function setRich(node,text){
+  const st=[];const keep=(t,v)=>{st.push([t,v]);return '\u0000'+(st.length-1)+'\u0000'};
+  let s=String(text||'');
+  s=s.replace(/```graph\s*([\s\S]*?)```/g,(m,j)=>keep('g',j));
+  s=s.replace(/\$\$([\s\S]+?)\$\$/g,(m,x)=>keep('d',x));
+  s=s.replace(/\\\[([\s\S]+?)\\\]/g,(m,x)=>keep('d',x));
+  s=s.replace(/\\\(([\s\S]+?)\\\)/g,(m,x)=>keep('i',x));
+  s=s.replace(/\$(?=\S)([^$\n]*?\S)\$/g,(m,x)=>keep('i',x));
+  let h=md(s);
+  h=h.replace(/\u0000(\d+)\u0000/g,(m,i)=>{const p=st[Number(i)];const e=encodeURIComponent(p[1].trim());
+    return p[0]==='g'?'<div class="gr" data-s="'+e+'"></div>':'<span class="mk" data-d="'+(p[0]==='d'?1:0)+'" data-t="'+e+'"></span>'});
+  node.innerHTML=h;
+  node.querySelectorAll('.mk').forEach(n=>{const t=decodeURIComponent(n.dataset.t);
+    if(window.katex){try{katex.render(t,n,{displayMode:n.dataset.d==='1',throwOnError:false})}catch(e){n.textContent=t}}else n.textContent=t});
+  node.querySelectorAll('.gr').forEach(n=>drawGraph(n,decodeURIComponent(n.dataset.s)))}
+function rich(cls,t){const e=el('div','rich '+cls);setRich(e,t);return e}
 
 let current=null,chatMsgs=[],tab='study';
 function showTab(t){tab=t;for(const n of['study','stats','set']){$('#v-'+n).hidden=n!==t;$('#n-'+n).className=n===t?'on':''}
@@ -665,23 +757,23 @@ async function loadNext(){
 function renderCard(c,waiting){
   const box=$('#card');box.replaceChildren();
   const tag=c.review?'REVIEW':(c.kind==='quiz'?'QUIZ':'LESSON');
-  box.append(el('div','tag',c.topic.split(':')[0]+' · '+tag),el('h2','',c.title),el('p','q',c.text));
-  const area=el('div'),fb=el('div','fb'),actions=el('div','row');box.append(area,fb,actions);
+  box.append(el('div','tag',c.topic.split(':')[0]+' · '+tag),el('h2','',c.title),rich('q',c.text));
+  const area=el('div'),fb=el('div','fb rich'),actions=el('div','row');box.append(area,fb,actions);
   if(waiting>0)box.append(el('div','muted',waiting+' more card'+(waiting>1?'s':'')+' waiting'));
   const more=btn('Tell me more',openChat,'btn ghost'),next=btn('Next card',loadNext,'btn primary');
   const skip=btn('Skip',async()=>{await api('/api/skip',{cid:c.cid});loadNext()},'btn ghost');
   if(c.kind==='quiz'){
-    const opts=c.options.map((o,i)=>{const b=el('button','opt','ABCD'[i]+')  '+o);
+    const opts=c.options.map((o,i)=>{const b=el('button','opt rich');setRich(b,'ABCD'[i]+')  '+o);
       b.onclick=async()=>{opts.forEach(x=>x.disabled=true);
         const j=await api('/api/answer',{cid:c.cid,index:i});
         if(j.error){fb.textContent=j.error;return}
         opts[j.correct_index].classList.add('good');if(!j.correct)opts[i].classList.add('bad');
-        fb.textContent=(j.correct?'Correct. ':'Not quite. ')+j.explanation;fb.className='fb '+(j.correct?'goodtxt':'badtxt');
+        setRich(fb,(j.correct?'**Correct.** ':'**Not quite.** ')+j.explanation);fb.className='fb rich '+(j.correct?'goodtxt':'badtxt');
         actions.replaceChildren(more,next)};return b});
     area.append(...opts);actions.append(skip);
   }else if(c.review){
     actions.append(btn('Reveal answer',()=>{
-      fb.textContent=c.answer;
+      setRich(fb,c.answer);
       const rate=r=>async()=>{await api('/api/rate',{cid:c.cid,result:r});
         area.replaceChildren(el('div','muted',r==='good'?'Nice, it moves further out.':r==='fuzzy'?'It will come back at the same spacing.':'It will come back tomorrow.'));
         actions.replaceChildren(more,next)};
@@ -693,7 +785,9 @@ function renderCard(c,waiting){
     actions.append(btn('Got it',async()=>{await api('/api/seen',{cid:c.cid});actions.replaceChildren(more,next)},'btn primary'),skip);
   }}
 
-function addMsg(role,text){const m=el('div','msg '+role,text);$('#log').append(m);$('#log').scrollTop=1e9;return m}
+function addMsg(role,text){const m=el('div','msg '+role+(role==='bot'?' rich':''));
+  if(role==='bot')setRich(m,text);else m.textContent=text;
+  $('#log').append(m);$('#log').scrollTop=1e9;return m}
 function openChat(){$('#chat').hidden=false;
   if(!chatMsgs.length)ask('Teach me this at university level: the underlying mechanism or theory, a worked example, common misconceptions, and how it connects to related ideas. Then ask me one question to check I understood.',true);
   $('#chat').scrollIntoView({behavior:'smooth'})}
@@ -701,7 +795,7 @@ async function ask(text,hidden){
   chatMsgs.push({role:'user',content:text});if(!hidden)addMsg('user',text);
   const t=addMsg('bot','Thinking…');
   const j=await api('/api/chat',{cid:current&&current.cid,messages:chatMsgs});
-  if(j.error){t.textContent='Error: '+j.error;chatMsgs.pop()}else{t.textContent=j.reply;chatMsgs.push({role:'assistant',content:j.reply})}
+  if(j.error){t.textContent='Error: '+j.error;chatMsgs.pop()}else{setRich(t,j.reply);chatMsgs.push({role:'assistant',content:j.reply})}
   $('#log').scrollTop=1e9}
 function sendChat(){const v=$('#chatin').value.trim();if(v){$('#chatin').value='';ask(v,false)}}
 $('#chatsend').onclick=sendChat;$('#chatin').addEventListener('keydown',e=>{if(e.key==='Enter')sendChat()});
@@ -739,7 +833,7 @@ async function enablePush(note){
 async function loadSettings(keep){
   const s=await api('/api/state'),v=$('#v-set');const prev=keep&&$('#pnote')?$('#pnote').textContent:'';v.replaceChildren();
   const p1=el('div','panel');p1.append(el('div','tag','NOTIFICATIONS'));
-  p1.append(el('p','muted',s.devices+' device'+(s.devices===1?'':'s')+' subscribed. Cards arrive at random times between 8am and 10pm NZ time.'));
+  p1.append(el('p','muted',s.devices+' device'+(s.devices===1?'':'s')+' subscribed. Cards arrive at random times during your active hours.'));
   const note=el('p','muted',prev);note.id='pnote';
   p1.append(btn('Enable notifications on this device',()=>enablePush(note),'btn primary'),el('div'));
   p1.append(btn('Send a test notification',async()=>{const j=await api('/api/test_push',{});note.textContent=j.sent?'Sent. Check your notifications.':'Nothing sent. Enable notifications first.'},'btn ghost'),note);
@@ -757,15 +851,33 @@ async function loadSettings(keep){
   sel.value=s.focus||'';sel.onchange=async()=>{await api('/api/settings',{action:'focus',value:sel.value})};
   p3.append(sel,el('p','muted','Reviews of cards you have already seen still come back whatever the focus.'));v.append(p3);
   const p4=el('div','panel');p4.append(el('div','tag','INSTALL'),el('p','muted','In Chrome, open the menu and choose Install app (or Add to Home screen). It then opens like a normal app with its own icon.'));
+  const p5=el('div','panel');p5.append(el('div','tag','MODEL'));
+  const ms=el('select');
+  for(const [id,label] of s.models)ms.append(new Option(label,id));
+  ms.value=s.model||'';
+  ms.onchange=async()=>{await api('/api/settings',{action:'model',value:ms.value})};
+  p5.append(ms,el('p','muted','Applies from the next card or reply. Stronger models are more accurate on hard material but cost more per call.'));v.append(p5);
   v.append(p4)}
 
+async function loadMode(){
+  const j=await api('/study/api/mode'),b=$('#studybtn');
+  if(j.on===undefined){b.hidden=true;return}
+  b.hidden=false;b.textContent=j.on?'Study mode: ON':'Study mode: off';b.className='sbtn'+(j.on?' on':'');b.title=j.count+' file(s) selected'}
+$('#studybtn').onclick=async()=>{
+  const j=await api('/study/api/mode');if(j.on===undefined)return;
+  const k=await api('/study/api/mode',{on:!j.on});
+  if(k.error){alert(k.error);return}
+  loadMode()};
 if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js');
-loadNext();
+loadNext();loadMode();
 </script></body></html>"""
 
 if not (KEY and APP_PASSWORD):
     print("Missing ANTHROPIC_KEY or APP_PASSWORD")
     raise RuntimeError("Set ANTHROPIC_KEY and APP_PASSWORD")
+
+import study
+study.init(app)
 
 threading.Thread(target=scheduler, daemon=True).start()
 print("Learning web app started")
