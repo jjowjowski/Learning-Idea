@@ -9,24 +9,41 @@ from cryptography.hazmat.primitives import serialization
 KEY = os.getenv("ANTHROPIC_KEY")
 APP_PASSWORD = os.getenv("APP_PASSWORD")
 VAPID_EMAIL = os.getenv("VAPID_EMAIL", "learning-app@example.com")
-MODEL = "claude-haiku-5-5"
+MODEL = os.getenv("MODEL", "claude-haiku-5-5")
 NZ = pytz.timezone("Pacific/Auckland")
 
-# ---- Settings you can edit ----
 TOPICS = [
-    "World history", "Economic history", "Econometrics", "Finance and markets",
-    "Macroeconomics", "Central banking and monetary policy", "Philosophy",
-    "NZ history and politics", "General trivia", "Science and technology",
+    "Econometrics: OLS assumptions, instrumental variables, panel data, time series",
+    "Microeconomics and game theory",
+    "Macroeconomics and monetary policy",
+    "Asset pricing and portfolio theory",
+    "Corporate finance and valuation",
+    "Derivatives and risk management",
+    "Probability and statistics",
+    "Linear algebra and calculus for economists",
+    "Economic history",
+    "World history: causes, turning points and historiography",
+    "NZ history and politics",
+    "Political theory",
+    "Epistemology and philosophy of science",
+    "Ethics and moral philosophy",
+    "Formal logic and reasoning",
+    "Physics and cosmology",
+    "Biology and evolution",
+    "Chemistry and materials",
+    "Computer science and algorithms",
+    "Psychology and behavioural economics",
+    "Law and institutions",
+    "General trivia with a surprising explanation",
 ]
 MIN_MINUTES = float(os.getenv("MIN_MINUTES", 30))
 MAX_MINUTES = float(os.getenv("MAX_MINUTES", 90))
-QUIET_START = 22            # no notifications from 10pm NZ time...
-QUIET_END = 8               # ...until 8am
-REVIEW_CHANCE = 0.6         # chance a notification card is a due review
-REVIEW_BACKLOG_LIMIT = 5    # if this many are due, reviews come first
+QUIET_START = 22
+QUIET_END = 8
+REVIEW_CHANCE = 0.6
+REVIEW_BACKLOG_LIMIT = 5
 INTERVALS_DAYS = [1, 3, 7, 16, 35, 90, 180]
-MAX_QUEUE = 3               # cards waiting before notifications stop making new ones
-# --------------------------------
+MAX_QUEUE = 3
 
 DATA_FILE = os.path.join(os.getenv("DATA_DIR", "."), "learning_data.json")
 lock = threading.Lock()
@@ -39,22 +56,22 @@ CARD_TOOL = {
         "properties": {
             "kind": {"type": "string", "enum": ["quiz", "fact"]},
             "title": {"type": "string", "description": "Short title, max 8 words"},
-            "content": {"type": "string", "description": "For a fact: 3-5 sentence explanation. For a quiz: the question."},
+            "content": {"type": "string", "description": "For a fact: a 150-250 word mini-lesson that builds the idea step by step, with the reasoning and a worked example or key formula where relevant. For a quiz: a scenario-based question that tests understanding, not memory."},
             "options": {"type": "array", "items": {"type": "string"}, "description": "Exactly 4 options for a quiz, empty for a fact"},
             "correct_index": {"type": "integer", "description": "0-3 for a quiz, -1 for a fact"},
-            "explanation": {"type": "string", "description": "For a quiz: why the answer is right, 2-3 sentences. Empty for a fact."},
-            "recall_question": {"type": "string", "description": "For a fact: one question testing recall of the key point without giving the answer away. Empty for a quiz."},
+            "explanation": {"type": "string", "description": "For a quiz: why the right answer is right and why each wrong option fails, 4-6 sentences. Empty for a fact."},
+            "recall_question": {"type": "string", "description": "For a fact: one question that makes the learner explain or apply the idea, without giving the answer away. Empty for a quiz."},
         },
         "required": ["kind", "title", "content", "options", "correct_index", "explanation", "recall_question"],
     },
 }
 
-TUTOR_SYSTEM = ("You are a patient, knowledgeable tutor for a university postgraduate studying economics and finance, "
-                "who also loves history and trivia. Explain clearly, go deeper when asked, use concrete examples, "
-                "and say so plainly if you are unsure about a fact. Keep answers focused and under about 250 words "
-                "unless asked for more. Use plain text with no markdown formatting.")
-
-# ---------------- data ----------------
+TUTOR_SYSTEM = ("You are a rigorous university tutor for a postgraduate studying economics and finance, who wants to understand "
+                "topics in real depth across many fields. Teach at university level: explain the mechanism or theory, give a worked "
+                "example, flag common misconceptions, and connect ideas to related concepts. Be precise, and say plainly if you are "
+                "unsure or if scholars disagree. After a substantial explanation, end with one question that checks whether the "
+                "learner really understood. If they answer, give honest feedback on what is right and what is missing. "
+                "Use plain text with no markdown formatting. Always finish your last sentence.")
 
 def now_nz():
     return datetime.datetime.now(NZ)
@@ -89,8 +106,6 @@ def save_data():
 
 data = load_data()
 
-# ---------------- push ----------------
-
 def get_vapid():
     with lock:
         if not data.get("vapid_pem"):
@@ -124,9 +139,7 @@ def push_all(title, body):
             save_data()
     return sent
 
-# ---------------- Claude ----------------
-
-def call_claude(messages, system=None, tools=None, tool_choice=None, max_tokens=1000):
+def call_claude(messages, system=None, tools=None, tool_choice=None, max_tokens=2000):
     body = {"model": MODEL, "max_tokens": max_tokens, "messages": messages}
     if system:
         body["system"] = system
@@ -135,7 +148,7 @@ def call_claude(messages, system=None, tools=None, tool_choice=None, max_tokens=
         body["tool_choice"] = tool_choice
     r = requests.post("https://api.anthropic.com/v1/messages",
                       headers={"x-api-key": KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                      json=body, timeout=60)
+                      json=body, timeout=90)
     if r.status_code != 200:
         raise RuntimeError(f"API error {r.status_code}: {r.text[:200]}")
     return r.json()
@@ -146,14 +159,14 @@ def generate_new_card():
         recent = "; ".join(data["history"][-40:]) or "none yet"
     kind = random.choice(["quiz", "quiz", "fact"])
     prompt = f"""Create one {kind} learning card on the topic: {topic}.
-The learner is a university postgraduate in economics and finance who enjoys history and trivia.
-Pitch it at an intelligent adult: interesting, specific and not obvious. For econometrics and finance, be intermediate to advanced.
-Accuracy matters most. Only include facts you are confident are correct and well established.
-Do not repeat or closely overlap these recently shown cards: {recent}
-For a quiz, give exactly 4 plausible options with one clearly correct answer, and put the correct position at random.
-For a fact, also write recall_question: a question that tests the key point without revealing the answer."""
+The learner is a university postgraduate in economics and finance who wants real, university-level understanding of a wide range of subjects, not trivia.
+Teach the underlying mechanism, theory or argument, not just a fact. Include the reasoning, and a worked example or key formula where it helps. Pick a specific, substantive idea within the topic.
+For a quiz, write a scenario or application question that needs reasoning to answer, with exactly 4 plausible options (the wrong ones should reflect common misconceptions) and the correct position at random.
+For a fact, also write recall_question: a question that makes the learner explain or apply the idea, without revealing the answer.
+Accuracy matters most. Only include material you are confident is correct and well established.
+Do not repeat or closely overlap these recently shown cards: {recent}"""
     resp = call_claude([{"role": "user", "content": prompt}], tools=[CARD_TOOL],
-                       tool_choice={"type": "tool", "name": "make_card"})
+                       tool_choice={"type": "tool", "name": "make_card"}, max_tokens=2000)
     card = None
     for b in resp.get("content", []):
         if b.get("type") == "tool_use":
@@ -166,8 +179,6 @@ For a fact, also write recall_question: a question that tests the key point with
             card.update({"kind": "fact", "options": [], "correct_index": -1})
     card["topic"] = topic
     return card
-
-# ---------------- spaced repetition ----------------
 
 def due_entries():
     n = now_nz()
@@ -217,8 +228,6 @@ def finish(inst, result):
     entry = data["deck"].get(inst.get("deck_id"))
     if entry:
         apply_result(entry, result, first=not inst.get("review"))
-
-# ---------------- cards / queue ----------------
 
 def dequeue(cid):
     if cid in data["queue"]:
@@ -306,8 +315,6 @@ def build_state():
             "queue": len(data["queue"]),
         }
 
-# ---------------- scheduler ----------------
-
 def scheduler():
     next_at = time.time() + 60
     while True:
@@ -325,12 +332,10 @@ def scheduler():
                 push_all("📚 Cards waiting", f"{qlen} cards are waiting for you")
                 continue
             cid, inst = make_instance()
-            body = "Time for a review" if inst.get("review") else f"New {inst['topic']} card"
+            body = "Time for a review" if inst.get("review") else "New card: " + inst["topic"].split(":")[0]
             push_all("📚 Learning card ready", body)
         except Exception as e:
             print(f"Scheduler error: {e}")
-
-# ---------------- web app ----------------
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY") or hashlib.sha256(((APP_PASSWORD or "x") + "learning").encode()).hexdigest()
@@ -512,7 +517,7 @@ def api_chat():
     msgs = []
     for m in (b.get("messages") or [])[-14:]:
         if m.get("role") in ("user", "assistant") and m.get("content"):
-            msgs.append({"role": m["role"], "content": str(m["content"])[:4000]})
+            msgs.append({"role": m["role"], "content": str(m["content"])[:6000]})
     while msgs and msgs[0]["role"] != "user":
         msgs.pop(0)
     if not msgs:
@@ -526,10 +531,12 @@ def api_chat():
                        f"\nExplanation: {inst.get('explanation', '')}"
                        "\nIf the learner has not answered the quiz yet, do not reveal the answer unless they ask.")
     try:
-        resp = call_claude(msgs, system=system, max_tokens=900)
+        resp = call_claude(msgs, system=system, max_tokens=1800)
         reply = "".join(x.get("text", "") for x in resp.get("content", []) if x.get("type") == "text").strip()
     except Exception as e:
         return jsonify(error=f"Couldn't reach Claude: {e}"), 500
+    if resp.get("stop_reason") == "max_tokens":
+        reply += "\n\n[This reply hit the length limit. Type 'continue' to get the rest.]"
     return jsonify(reply=reply or "I couldn't come up with an answer, try rephrasing.")
 
 @app.post("/api/settings")
@@ -546,7 +553,7 @@ def api_settings():
         elif a == "resume":
             data["paused_until"] = None
         elif a == "focus":
-            v = str(b.get("value") or "").strip()[:60]
+            v = str(b.get("value") or "").strip()[:80]
             data["focus"] = v or None
         save_data()
     return jsonify(build_state())
@@ -595,19 +602,19 @@ APP_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,sans-serif;padding-bottom:76px}
 header{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;font-weight:700;font-size:18px}
 #streak{font-size:14px;color:var(--muted);font-weight:500}
-main{max-width:640px;margin:0 auto;padding:0 14px}
+main{max-width:680px;margin:0 auto;padding:0 14px}
 .panel{background:var(--card);border-radius:16px;padding:18px;margin-bottom:14px}
 .tag{color:var(--accent);font-size:12px;font-weight:700;letter-spacing:.04em}
-h2{margin:6px 0 10px;font-size:21px}.q{font-size:16px;line-height:1.5;margin:0 0 14px;white-space:pre-wrap}
+h2{margin:6px 0 10px;font-size:21px}.q{font-size:16px;line-height:1.6;margin:0 0 14px;white-space:pre-wrap}
 .muted{color:var(--muted);font-size:14px;line-height:1.5}
 .opt,.btn{display:block;width:100%;text-align:left;border:0;border-radius:12px;padding:14px;margin-bottom:8px;font-size:15px;color:var(--fg);background:var(--card2);cursor:pointer;min-height:48px}
 .btn{text-align:center;font-weight:600}.primary{background:var(--accent);color:#fff}.ghost{background:transparent;border:1px solid #3a3d4d}
 .opt.good{background:var(--good);color:#fff}.opt.bad{background:var(--bad);color:#fff}.opt:disabled{opacity:1}
-.row{display:flex;gap:8px}.row .btn{margin-bottom:0}.fb{margin:6px 0 12px;line-height:1.5;white-space:pre-wrap}
+.row{display:flex;gap:8px}.row .btn{margin-bottom:0}.fb{margin:6px 0 12px;line-height:1.6;white-space:pre-wrap}
 .goodtxt{color:#5fd493}.badtxt{color:#ee8a84}
-#log{max-height:42vh;overflow-y:auto;margin-bottom:10px}
-.msg{padding:10px 12px;border-radius:12px;margin-bottom:8px;white-space:pre-wrap;line-height:1.5;font-size:15px}
-.msg.user{background:var(--accent);margin-left:20%}.msg.bot{background:var(--card2);margin-right:6%}
+#log{max-height:55vh;overflow-y:auto;margin-bottom:10px}
+.msg{padding:10px 12px;border-radius:12px;margin-bottom:8px;white-space:pre-wrap;line-height:1.6;font-size:15px}
+.msg.user{background:var(--accent);margin-left:20%}.msg.bot{background:var(--card2);margin-right:4%}
 #chatrow{display:flex;gap:8px}#chatin{flex:1;background:var(--card2);color:var(--fg);border:0;border-radius:12px;padding:13px;font-size:16px}
 #chatsend{width:84px;margin:0}
 nav{position:fixed;bottom:0;left:0;right:0;background:var(--card);display:flex;border-top:1px solid #2b2d38}
@@ -618,7 +625,7 @@ nav button.on{color:var(--accent);font-weight:700}
 .heat{display:grid;grid-template-columns:repeat(7,1fr);gap:5px}.heat div{aspect-ratio:1;border-radius:5px;background:var(--card2)}
 .l1{background:#2c4a80!important}.l2{background:#3b6bc4!important}.l3{background:#4f8cff!important}
 select{width:100%;background:var(--card2);color:var(--fg);border:0;border-radius:12px;padding:13px;font-size:15px;margin-bottom:8px}
-.trow{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid #2b2d38;font-size:14px}
+.trow{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid #2b2d38;font-size:14px;gap:10px}
 </style></head><body>
 <header><span>📚 Learning</span><span id="streak"></span></header>
 <main>
@@ -626,7 +633,7 @@ select{width:100%;background:var(--card2);color:var(--fg);border:0;border-radius
   <div class="panel" id="card"></div>
   <div class="panel" id="chat" hidden>
     <div class="tag">TUTOR</div><div id="log"></div>
-    <div id="chatrow"><input id="chatin" placeholder="Ask a follow-up…" autocomplete="off"><button class="btn primary" id="chatsend">Send</button></div>
+    <div id="chatrow"><input id="chatin" placeholder="Ask a follow-up, or answer the tutor's question…" autocomplete="off"><button class="btn primary" id="chatsend">Send</button></div>
   </div>
 </section>
 <section id="v-stats" hidden></section>
@@ -657,8 +664,8 @@ async function loadNext(){
 
 function renderCard(c,waiting){
   const box=$('#card');box.replaceChildren();
-  const tag=c.review?'REVIEW':(c.kind==='quiz'?'QUIZ':'DID YOU KNOW');
-  box.append(el('div','tag',c.topic+' · '+tag),el('h2','',c.title),el('p','q',c.text));
+  const tag=c.review?'REVIEW':(c.kind==='quiz'?'QUIZ':'LESSON');
+  box.append(el('div','tag',c.topic.split(':')[0]+' · '+tag),el('h2','',c.title),el('p','q',c.text));
   const area=el('div'),fb=el('div','fb'),actions=el('div','row');box.append(area,fb,actions);
   if(waiting>0)box.append(el('div','muted',waiting+' more card'+(waiting>1?'s':'')+' waiting'));
   const more=btn('Tell me more',openChat,'btn ghost'),next=btn('Next card',loadNext,'btn primary');
@@ -688,7 +695,7 @@ function renderCard(c,waiting){
 
 function addMsg(role,text){const m=el('div','msg '+role,text);$('#log').append(m);$('#log').scrollTop=1e9;return m}
 function openChat(){$('#chat').hidden=false;
-  if(!chatMsgs.length)ask('Give me a deeper explanation of this with context, then suggest two things I could explore next.',true);
+  if(!chatMsgs.length)ask('Teach me this at university level: the underlying mechanism or theory, a worked example, common misconceptions, and how it connects to related ideas. Then ask me one question to check I understood.',true);
   $('#chat').scrollIntoView({behavior:'smooth'})}
 async function ask(text,hidden){
   chatMsgs.push({role:'user',content:text});if(!hidden)addMsg('user',text);
@@ -714,7 +721,7 @@ async function loadStats(){
   const tp=el('div','panel');tp.append(el('div','tag','QUIZ SCORE BY TOPIC'));
   const keys=Object.keys(s.topic_stats).sort();
   if(!keys.length)tp.append(el('div','muted','Answer a few quizzes and your topics will show up here.'));
-  for(const k of keys){const[r,w]=s.topic_stats[k];const row=el('div','trow');row.append(el('span','',k),el('span','',r+'/'+(r+w)));tp.append(row)}
+  for(const k of keys){const[r,w]=s.topic_stats[k];const row=el('div','trow');row.append(el('span','',k.split(':')[0]),el('span','',r+'/'+(r+w)));tp.append(row)}
   v.append(tp)}
 
 function b64(s){const p='='.repeat((4-s.length%4)%4),r=atob((s+p).replace(/-/g,'+').replace(/_/g,'/'));return Uint8Array.from([...r].map(c=>c.charCodeAt(0)))}
@@ -732,7 +739,7 @@ async function enablePush(note){
 async function loadSettings(keep){
   const s=await api('/api/state'),v=$('#v-set');const prev=keep&&$('#pnote')?$('#pnote').textContent:'';v.replaceChildren();
   const p1=el('div','panel');p1.append(el('div','tag','NOTIFICATIONS'));
-  p1.append(el('p','muted',s.devices+' device'+(s.devices===1?'':'s')+' subscribed. Cards arrive at random times between '+'8am and 10pm NZ time.'));
+  p1.append(el('p','muted',s.devices+' device'+(s.devices===1?'':'s')+' subscribed. Cards arrive at random times between 8am and 10pm NZ time.'));
   const note=el('p','muted',prev);note.id='pnote';
   p1.append(btn('Enable notifications on this device',()=>enablePush(note),'btn primary'),el('div'));
   p1.append(btn('Send a test notification',async()=>{const j=await api('/api/test_push',{});note.textContent=j.sent?'Sent. Check your notifications.':'Nothing sent. Enable notifications first.'},'btn ghost'),note);
@@ -745,7 +752,7 @@ async function loadSettings(keep){
   p2.append(row);v.append(p2);
   const p3=el('div','panel');p3.append(el('div','tag','FOCUS TOPIC (NEW CARDS)'));
   const sel=el('select');sel.append(new Option('Mix of everything',''));
-  for(const t of s.topics)sel.append(new Option(t,t));
+  for(const t of s.topics)sel.append(new Option(t.split(':')[0],t));
   if(s.focus&&!s.topics.includes(s.focus))sel.append(new Option(s.focus,s.focus));
   sel.value=s.focus||'';sel.onchange=async()=>{await api('/api/settings',{action:'focus',value:sel.value})};
   p3.append(sel,el('p','muted','Reviews of cards you have already seen still come back whatever the focus.'));v.append(p3);
