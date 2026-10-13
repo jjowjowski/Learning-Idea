@@ -70,10 +70,10 @@ CARD_TOOL = {
         "properties": {
             "kind": {"type": "string", "enum": ["quiz", "fact"]},
             "title": {"type": "string", "description": "Short title, max 8 words"},
-            "content": {"type": "string", "description": "For a fact: a 150-250 word mini-lesson that builds the idea step by step, with the reasoning and a worked example or key formula where relevant (maths in LaTeX). For a quiz: a scenario-based question that tests understanding, not memory."},
-            "options": {"type": "array", "items": {"type": "string"}, "description": "Exactly 4 options for a quiz, empty for a fact"},
+            "content": {"type": "string", "description": "For a fact: a 150-250 word mini-lesson that builds the idea step by step, with the reasoning and a worked example or key formula where relevant (maths in LaTeX). For a quiz: a clear question that needs reasoning but contains only the problem, with no method, formula or hints."},
+            "options": {"type": "array", "items": {"type": "string"}, "description": "Exactly 4 short answer choices for a quiz, empty for a fact. Never include reasons, 'because' clauses or hints in the options."},
             "correct_index": {"type": "integer", "description": "0-3 for a quiz, -1 for a fact"},
-            "explanation": {"type": "string", "description": "For a quiz: why the right answer is right and why each wrong option fails, 4-6 sentences. Empty for a fact."},
+            "explanation": {"type": "string", "description": "For a quiz: step-by-step working, why the right answer is right and why each wrong option fails, 4-8 sentences. Empty for a fact."},
             "recall_question": {"type": "string", "description": "For a fact: one question that makes the learner explain or apply the idea, without giving the answer away. Empty for a quiz."},
         },
         "required": ["kind", "title", "content", "options", "correct_index", "explanation", "recall_question"],
@@ -176,9 +176,9 @@ def generate_new_card():
         recent = "; ".join(data["history"][-40:]) or "none yet"
     kind = random.choice(["quiz", "quiz", "fact"])
     prompt = f"""Create one {kind} learning card on the topic: {topic}.
-The learner is a university postgraduate in economics and finance who wants real, university-level understanding of a wide range of subjects, not trivia.
+The learner is a smart university-level reader who may well be meeting this topic for the first time, so do not assume prior knowledge. Define any technical term and any notation the first time you use it, start from the intuition before the formal version, and prefer natural-frequency or concrete examples over abstract formulas. Teach real understanding, not trivia.
 Teach the underlying mechanism, theory or argument, not just a fact. Include the reasoning, and a worked example or key formula where it helps. Pick a specific, substantive idea within the topic.
-For a quiz, write a scenario or application question that needs reasoning to answer, with exactly 4 plausible options (the wrong ones should reflect common misconceptions) and the correct position at random.
+For a quiz, write a clear question that needs reasoning but contains only the problem. Never include the method, the formula, the theorem name or hints in the question. Give exactly 4 short options with no reasoning attached, where the wrong ones reflect genuine common mistakes, and put the correct position at random. Put all the reasoning in the explanation, including a step-by-step working.
 For a fact, also write recall_question: a question that makes the learner explain or apply the idea, without revealing the answer. A fact lesson may include one graph block if a diagram genuinely helps.
 Accuracy matters most. Only include material you are confident is correct and well established.
 Do not repeat or closely overlap these recently shown cards: {recent}
@@ -489,7 +489,7 @@ def api_answer():
         data["stats"]["right" if ok else "wrong"] += 1
         ts[0 if ok else 1] += 1
         log_study()
-        finish(inst, "good" if ok else "bad")
+        finish(inst, ("fuzzy" if inst.get("hints") else "good") if ok else "bad")
         dequeue(cid)
         save_data()
     return jsonify(correct=ok, correct_index=inst["correct_index"], explanation=inst.get("explanation", ""))
@@ -530,6 +530,54 @@ def api_skip():
         dequeue(cid)
         save_data()
     return jsonify(ok=True)
+
+@app.post("/api/hint")
+@need_auth
+def api_hint():
+    b = request.get_json(silent=True) or {}
+    inst = data["cards"].get(b.get("cid"))
+    if not inst or inst.get("answered") or inst.get("rated"):
+        return jsonify(error="That card is no longer available."), 400
+    level = int(inst.get("hints", 0)) + 1
+    if level > 2:
+        return jsonify(hint=inst.get("last_hint", ""), level=2, done=True)
+    if inst["kind"] == "quiz":
+        material = (f"Question: {inst['content']}\nOptions: {inst['options']}\n"
+                    f"Correct answer (secret): {inst['options'][inst['correct_index']]}\n"
+                    f"Explanation (secret): {inst.get('explanation', '')}")
+    else:
+        material = (f"Question: {inst.get('recall_question') or inst['title']}\n"
+                    f"Full answer (secret): {inst['content']}")
+    how = ("a gentle nudge: name the key idea or the first step to think about" if level == 1 else
+           "a stronger hint: set up the method or rule out a wrong approach, so the learner is one step from the answer")
+    prompt = (f"A learner is stuck on this question and wants a hint, not the answer.\n\n{material}\n\n"
+              f"Write {how}, in 1-3 short sentences. Never state the final answer, never say which option is correct, "
+              f"and never quote the secret parts. Write any maths in LaTeX with $...$. Plain text only.")
+    try:
+        resp = call_claude([{"role": "user", "content": prompt}], max_tokens=300)
+        hint = "".join(x.get("text", "") for x in resp.get("content", []) if x.get("type") == "text").strip()
+    except Exception as e:
+        return jsonify(error=f"Couldn't make a hint: {e}"), 500
+    with lock:
+        inst["hints"] = level
+        inst["last_hint"] = hint
+        save_data()
+    return jsonify(hint=hint, level=level, done=level >= 2)
+
+@app.post("/api/unsure")
+@need_auth
+def api_unsure():
+    cid = (request.get_json(silent=True) or {}).get("cid")
+    inst = data["cards"].get(cid)
+    if not inst or inst["kind"] != "quiz" or inst.get("answered"):
+        return jsonify(error="That card is no longer available."), 400
+    with lock:
+        inst["answered"] = True
+        log_study()
+        finish(inst, "bad")
+        dequeue(cid)
+        save_data()
+    return jsonify(correct_index=inst["correct_index"], explanation=inst.get("explanation", ""))
 
 @app.post("/api/chat")
 @need_auth
@@ -647,8 +695,9 @@ h2{margin:6px 0 10px;font-size:21px}.q{font-size:16px;line-height:1.6;margin:0 0
 .muted{color:var(--muted);font-size:14px;line-height:1.5}
 .opt,.btn{display:block;width:100%;text-align:left;border:0;border-radius:12px;padding:14px;margin-bottom:8px;font-size:15px;color:var(--fg);background:var(--card2);cursor:pointer;min-height:48px}
 .btn{text-align:center;font-weight:600}.primary{background:var(--accent);color:#fff}.ghost{background:transparent;border:1px solid #3a3d4d}
+.btn:disabled{opacity:.5}
 .opt.good{background:var(--good);color:#fff}.opt.bad{background:var(--bad);color:#fff}.opt:disabled{opacity:1}
-.row{display:flex;gap:8px}.row .btn{margin-bottom:0}.fb{margin:6px 0 12px;line-height:1.6}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row .btn{margin-bottom:0;flex:1;min-width:110px}.row:empty{display:none}.fb{margin:6px 0 12px;line-height:1.6}.fb:empty{display:none}
 .goodtxt{color:#5fd493}.badtxt{color:#ee8a84}
 #log{max-height:60vh;overflow-y:auto;margin-bottom:10px}
 .msg{padding:10px 12px;border-radius:12px;margin-bottom:8px;line-height:1.6;font-size:15px}
@@ -758,10 +807,23 @@ function renderCard(c,waiting){
   const box=$('#card');box.replaceChildren();
   const tag=c.review?'REVIEW':(c.kind==='quiz'?'QUIZ':'LESSON');
   box.append(el('div','tag',c.topic.split(':')[0]+' · '+tag),el('h2','',c.title),rich('q',c.text));
-  const area=el('div'),fb=el('div','fb rich'),actions=el('div','row');box.append(area,fb,actions);
+  const hintBox=el('div','fb rich muted'),area=el('div'),fb=el('div','fb rich'),helpRow=el('div','row'),actions=el('div','row');
+  box.append(hintBox,area,fb,helpRow,actions);
   if(waiting>0)box.append(el('div','muted',waiting+' more card'+(waiting>1?'s':'')+' waiting'));
-  const more=btn('Tell me more',openChat,'btn ghost'),next=btn('Next card',loadNext,'btn primary');
+  const next=btn('Next card',loadNext,'btn primary');
+  const more=btn('Tell me more',()=>openChat('more'),'btn ghost');
+  const basics=btn('Explain basics',()=>openChat('basics'),'btn ghost');
+  const askq=btn('Ask a question',()=>openChat('blank'),'btn ghost');
   const skip=btn('Skip',async()=>{await api('/api/skip',{cid:c.cid});loadNext()},'btn ghost');
+  const hintBtn=btn('Hint',async()=>{
+    hintBtn.disabled=true;
+    const j=await api('/api/hint',{cid:c.cid});
+    if(j.error){hintBox.textContent=j.error;hintBtn.disabled=false;return}
+    setRich(hintBox,'**Hint '+j.level+':** '+j.hint);
+    if(j.done){hintBtn.textContent='No more hints'}else{hintBtn.textContent='Another hint';hintBtn.disabled=false}
+  },'btn ghost');
+  const afterAnswer=()=>{helpRow.replaceChildren();actions.replaceChildren(more,next)};
+
   if(c.kind==='quiz'){
     const opts=c.options.map((o,i)=>{const b=el('button','opt rich');setRich(b,'ABCD'[i]+')  '+o);
       b.onclick=async()=>{opts.forEach(x=>x.disabled=true);
@@ -769,27 +831,42 @@ function renderCard(c,waiting){
         if(j.error){fb.textContent=j.error;return}
         opts[j.correct_index].classList.add('good');if(!j.correct)opts[i].classList.add('bad');
         setRich(fb,(j.correct?'**Correct.** ':'**Not quite.** ')+j.explanation);fb.className='fb rich '+(j.correct?'goodtxt':'badtxt');
-        actions.replaceChildren(more,next)};return b});
-    area.append(...opts);actions.append(skip);
+        afterAnswer()};return b});
+    area.append(...opts);
+    const unsure=btn("I'm not sure",async()=>{opts.forEach(x=>x.disabled=true);
+      const j=await api('/api/unsure',{cid:c.cid});
+      if(j.error){fb.textContent=j.error;return}
+      opts[j.correct_index].classList.add('good');
+      setRich(fb,"**No problem. Here's the answer.** "+j.explanation);
+      afterAnswer()},'btn ghost');
+    helpRow.append(hintBtn,basics,unsure);
+    actions.append(askq,skip);
   }else if(c.review){
+    helpRow.append(hintBtn,basics);
     actions.append(btn('Reveal answer',()=>{
       setRich(fb,c.answer);
       const rate=r=>async()=>{await api('/api/rate',{cid:c.cid,result:r});
         area.replaceChildren(el('div','muted',r==='good'?'Nice, it moves further out.':r==='fuzzy'?'It will come back at the same spacing.':'It will come back tomorrow.'));
-        actions.replaceChildren(more,next)};
+        afterAnswer()};
       const row=el('div','row');
       row.append(btn('Knew it',rate('good'),'btn primary'),btn('Fuzzy',rate('fuzzy'),'btn'),btn('Forgot',rate('bad'),'btn'));
-      area.replaceChildren(row);actions.replaceChildren();
-    },'btn primary'),skip);
+      area.replaceChildren(row);actions.replaceChildren();helpRow.replaceChildren();
+    },'btn primary'),askq,skip);
   }else{
-    actions.append(btn('Got it',async()=>{await api('/api/seen',{cid:c.cid});actions.replaceChildren(more,next)},'btn primary'),skip);
+    actions.append(btn('Got it',async()=>{await api('/api/seen',{cid:c.cid});afterAnswer()},'btn primary'),more,skip);
   }}
 
 function addMsg(role,text){const m=el('div','msg '+role+(role==='bot'?' rich':''));
   if(role==='bot')setRich(m,text);else m.textContent=text;
   $('#log').append(m);$('#log').scrollTop=1e9;return m}
-function openChat(){$('#chat').hidden=false;
-  if(!chatMsgs.length)ask('Teach me this at university level: the underlying mechanism or theory, a worked example, common misconceptions, and how it connects to related ideas. Then ask me one question to check I understood.',true);
+function openChat(mode){
+  $('#chat').hidden=false;
+  const openers={
+    basics:"I haven't answered yet. Explain the background ideas and key terms I need to understand this question, in plain language, starting from intuition with a simple example. Do not tell me the answer or which option is correct. Then stop and let me try.",
+    more:"Teach me this at university level: the underlying mechanism or theory, a worked example, common misconceptions, and how it connects to related ideas. Then ask me one question to check I understood."
+  };
+  if(openers[mode])ask(openers[mode],true);
+  else if(!chatMsgs.length)addMsg('bot','Ask me anything about this card. I will not give away a quiz answer unless you ask.');
   $('#chat').scrollIntoView({behavior:'smooth'})}
 async function ask(text,hidden){
   chatMsgs.push({role:'user',content:text});if(!hidden)addMsg('user',text);
@@ -850,13 +927,13 @@ async function loadSettings(keep){
   if(s.focus&&!s.topics.includes(s.focus))sel.append(new Option(s.focus,s.focus));
   sel.value=s.focus||'';sel.onchange=async()=>{await api('/api/settings',{action:'focus',value:sel.value})};
   p3.append(sel,el('p','muted','Reviews of cards you have already seen still come back whatever the focus.'));v.append(p3);
-  const p4=el('div','panel');p4.append(el('div','tag','INSTALL'),el('p','muted','In Chrome, open the menu and choose Install app (or Add to Home screen). It then opens like a normal app with its own icon.'));
   const p5=el('div','panel');p5.append(el('div','tag','MODEL'));
   const ms=el('select');
   for(const [id,label] of s.models)ms.append(new Option(label,id));
   ms.value=s.model||'';
   ms.onchange=async()=>{await api('/api/settings',{action:'model',value:ms.value})};
   p5.append(ms,el('p','muted','Applies from the next card or reply. Stronger models are more accurate on hard material but cost more per call.'));v.append(p5);
+  const p4=el('div','panel');p4.append(el('div','tag','INSTALL'),el('p','muted','In Chrome, open the menu and choose Install app (or Add to Home screen). It then opens like a normal app with its own icon.'));
   v.append(p4)}
 
 async function loadMode(){
